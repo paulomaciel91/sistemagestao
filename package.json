@@ -1,0 +1,26 @@
+{
+  "name": "sistema-gestao-lojas",
+  "version": "1.0.0",
+  "description": "Sistema de gestão para lojas de roupas com integração Supabase e N8N",
+  "main": "index.js",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/auth-helpers-nextjs": "^0.8.3",
+    "@supabase/supabase-js": "^2.49.4",
+    "autoprefixer": "^10.4.16",
+    "chart.js": "^4.4.9",
+    "next": "^14.1.0",
+    "postcss": "^8.4.31",
+    "react": "^18.2.0",
+    "react-chartjs-2": "^5.3.0",
+    "react-dom": "^18.2.0",
+    "react-hook-form": "^7.48.2",
+    "react-icons": "^4.12.0",
+    "react-toastify": "^9.1.3",
+    "tailwindcss": "^3.3.5"
+  }
+}
