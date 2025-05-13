@@ -232,7 +232,7 @@ export default async function handler(req, res) {
         cliente_id: clienteId || null,
         itens: [novoItem],
         valor_total: novoItem.subtotal,
-        quantidade_itens: quantidade,
+        quantidade_itens: novoItem.quantidade,
         ativo: true,
         observacoes: observacoes || null
       };
@@ -272,11 +272,13 @@ export default async function handler(req, res) {
         novosItens = [...itensAtuais];
         novosItens[itemExistenteIndex].quantidade += quantidade;
         novosItens[itemExistenteIndex].subtotal = novosItens[itemExistenteIndex].preco * novosItens[itemExistenteIndex].quantidade;
-        novaQuantidade = carrinhoParaUsar.quantidade_itens + quantidade;
+        // Calcular a quantidade total correta somando todas as quantidades individuais
+        novaQuantidade = novosItens.reduce((total, item) => total + item.quantidade, 0);
       } else {
         // Adicionar novo item
         novosItens = [...itensAtuais, novoItem];
-        novaQuantidade = carrinhoParaUsar.quantidade_itens + quantidade;
+        // Calcular a quantidade total correta somando todas as quantidades individuais
+        novaQuantidade = novosItens.reduce((total, item) => total + item.quantidade, 0);
       }
 
       // Calcular novo valor total
