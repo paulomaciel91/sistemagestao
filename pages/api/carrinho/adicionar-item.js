@@ -1,5 +1,32 @@
 import { createClient } from '@supabase/supabase-js';
 
+// Utilitários para lidar com a coluna "itens" como jsonb (array) ou text (JSON string)
+function toArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeItensArray(arr) {
+  // Garante números para quantidade/preço/subtotal
+  return (Array.isArray(arr) ? arr : []).map((i) => {
+    const preco = Number(i?.preco) || 0;
+    const qtd = Number(i?.quantidade) || 0;
+    const subtotal = Number(i?.subtotal);
+    return {
+      ...i,
+      preco,
+      quantidade: qtd,
+      subtotal: Number.isFinite(subtotal) ? subtotal : (preco * qtd),
+    };
+  });
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Método não permitido' });
@@ -19,16 +46,16 @@ export default async function handler(req, res) {
       supabaseKey
     } = req.body;
 
-    // Validação básica
-    if (!lojaId || !sessionId || !produtoId || !quantidade) {
+    // --- Quantidade como número (EVITA "011") ---
+    const qty = Number(quantidade);
+    if (!lojaId || !sessionId || !produtoId || !Number.isFinite(qty) || qty <= 0) {
       return res.status(400).json({ 
         success: false,
-        error: 'Parâmetros obrigatórios não fornecidos',
-        detalhes: 'lojaId, sessionId, produtoId e quantidade são obrigatórios'
+        error: 'Parâmetros obrigatórios não fornecidos/invalidos',
+        detalhes: 'lojaId, sessionId, produtoId e quantidade numérica > 0 são obrigatórios'
       });
     }
 
-    // Validar credenciais do Supabase
     if (!supabaseUrl || !supabaseKey) {
       return res.status(400).json({ 
         success: false,
@@ -36,10 +63,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // Criar cliente Supabase usando as credenciais fornecidas
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // 1. Buscar informações do produto
+    // 1) Produto
     const { data: produto, error: produtoError } = await supabase
       .from(`${lojaId}_produtos`)
       .select('*')
@@ -54,12 +80,11 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2. Verificar disponibilidade de estoque
+    // 2) Estoque (usa qty)
     let estoqueDisponivel = true;
     let mensagemEstoque = '';
 
     if (produto.estoque_por_variante) {
-      // Verificar estoque específico para a variante
       const { data: estoque, error: estoqueError } = await supabase
         .from(`${lojaId}_estoque`)
         .select('*')
@@ -71,35 +96,30 @@ export default async function handler(req, res) {
       if (estoqueError || !estoque) {
         estoqueDisponivel = false;
         mensagemEstoque = `Variante não disponível (cor: ${cor || 'N/A'}, tamanho: ${tamanho || 'N/A'})`;
-      } else if (estoque.quantidade < quantidade) {
+      } else if (Number(estoque.quantidade) < qty) {
         estoqueDisponivel = false;
-        mensagemEstoque = `Estoque insuficiente. Disponível: ${estoque.quantidade} unidades`;
+        mensagemEstoque = `Estoque insuficiente. Disponível: ${Number(estoque.quantidade)} unidades`;
       }
     } else {
-      // Verificar estoque geral do produto
-      if (produto.estoque_quantidade < quantidade) {
+      if (Number(produto.estoque_quantidade) < qty) {
         estoqueDisponivel = false;
-        mensagemEstoque = `Estoque insuficiente. Disponível: ${produto.estoque_quantidade} unidades`;
+        mensagemEstoque = `Estoque insuficiente. Disponível: ${Number(produto.estoque_quantidade)} unidades`;
       }
 
-      // Verificar se a cor solicitada está disponível
       if (cor && produto.cores_disponiveis) {
         const coresDisponiveis = Array.isArray(produto.cores_disponiveis) 
           ? produto.cores_disponiveis 
-          : JSON.parse(produto.cores_disponiveis || '[]');
-          
+          : toArray(produto.cores_disponiveis);
         if (!coresDisponiveis.includes(cor)) {
           estoqueDisponivel = false;
           mensagemEstoque = `Cor ${cor} não disponível. Cores disponíveis: ${coresDisponiveis.join(', ')}`;
         }
       }
 
-      // Verificar se o tamanho solicitado está disponível
       if (tamanho && produto.tamanhos_disponiveis) {
         const tamanhosDisponiveis = Array.isArray(produto.tamanhos_disponiveis) 
           ? produto.tamanhos_disponiveis 
-          : JSON.parse(produto.tamanhos_disponiveis || '[]');
-          
+          : toArray(produto.tamanhos_disponiveis);
         if (!tamanhosDisponiveis.includes(tamanho)) {
           estoqueDisponivel = false;
           mensagemEstoque = `Tamanho ${tamanho} não disponível. Tamanhos disponíveis: ${tamanhosDisponiveis.join(', ')}`;
@@ -115,7 +135,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // 3. Verificar se já existe um carrinho para esta sessão
+    // 3) Carrinho existente ativo por sessão
     const { data: carrinhoExistente, error: carrinhoError } = await supabase
       .from(`${lojaId}_carrinho_compras`)
       .select('*')
@@ -123,98 +143,68 @@ export default async function handler(req, res) {
       .eq('ativo', true)
       .maybeSingle();
 
-    // Variável para armazenar o carrinho que vamos usar
     let carrinhoParaUsar = carrinhoExistente;
 
-    // Verificar se a tabela possui o campo 'status'
-    let temCampoStatus = true; // Assumir que o campo existe por padrão
+    // Verifica se há campo 'status' (tabela pode variar)
+    let temCampoStatus = true;
     try {
-      // Tentativa simples de verificar se o campo status existe
-      // sem usar information_schema
-      const { data: campoTest, error: campoError } = await supabase
+      const { error: campoError } = await supabase
         .from(`${lojaId}_carrinho_compras`)
         .select('status')
         .limit(1);
-        
-      // Se der erro específico de coluna inexistente, marcamos como falso
-      if (campoError && 
-          (campoError.message.includes('column') && 
-           campoError.message.includes('does not exist'))) {
+      if (campoError && (campoError.message?.includes('column') && campoError.message?.includes('does not exist'))) {
         temCampoStatus = false;
       }
-    } catch (schemaError) {
-      console.warn('Erro ao verificar campo status:', schemaError);
-      // Continuamos mesmo sem conseguir verificar
+    } catch (_) {
+      // segue o jogo
     }
 
-    // Verificar se existe um carrinho abandonado para esta sessão
+    // Se não existir carrinho ativo, tenta reativar abandonado da mesma sessão
     if (!carrinhoParaUsar) {
       let query = supabase
         .from(`${lojaId}_carrinho_compras`)
         .select('*')
         .eq('session_id', sessionId)
         .eq('ativo', false);
-      
-      // Adicionar filtro por status apenas se o campo existir
-      if (temCampoStatus) {
-        query = query.eq('status', 'abandonado');
-      }
-      
-      const { data: carrinhoAbandonado, error: abandonadoError } = await query
+
+      if (temCampoStatus) query = query.eq('status', 'abandonado');
+
+      const { data: carrinhoAbandonado } = await query
         .order('updated_at', { ascending: false })
         .maybeSingle();
 
-      // Se existir um carrinho abandonado, reativá-lo antes de adicionar o item
-      if (carrinhoAbandonado && !abandonadoError) {
-        console.log(`Reativando carrinho abandonado ID: ${carrinhoAbandonado.id}`);
-        
-        // Preparar dados para reativação
+      if (carrinhoAbandonado) {
         const dadosReativacao = {
           ativo: true,
-          updated_at: new Date().toISOString()
+          updated_at: new Date().toISOString(),
+          ...(temCampoStatus ? { status: 'ativo' } : {})
         };
-        
-        // Adicionar campo status apenas se existir na tabela
-        if (temCampoStatus) {
-          dadosReativacao.status = 'ativo';
-        }
-        
-        // Reativar o carrinho abandonado
+
         const { error: reativarError } = await supabase
           .from(`${lojaId}_carrinho_compras`)
           .update(dadosReativacao)
           .eq('id', carrinhoAbandonado.id);
-          
-        if (reativarError) {
-          console.error('Erro ao reativar carrinho abandonado:', reativarError);
-        } else {
-          // Usar o carrinho reativado
-          // Criamos um novo objeto com as propriedades atualizadas
-          carrinhoParaUsar = {
-            ...carrinhoAbandonado,
-            ativo: true
-          };
-          
-          // Adicionar status apenas se o campo existir
-          if (temCampoStatus) {
-            carrinhoParaUsar.status = 'ativo';
-          }
+
+        if (!reativarError) {
+          carrinhoParaUsar = { ...carrinhoAbandonado, ...dadosReativacao };
         }
       }
     }
 
-    // Calcular preço do item
-    const precoItem = produto.preco_promocional && produto.preco_promocional > 0 
-      ? produto.preco_promocional 
-      : produto.preco;
+    // 4) Preço do item (número)
+    const precoItem = Number(
+      (produto.preco_promocional && produto.preco_promocional > 0) 
+        ? produto.preco_promocional 
+        : produto.preco
+    ) || 0;
 
-    // Preparar o item para adicionar ao carrinho
+    // 5) Monta item novo com números
     const novoItem = {
       produto_id: produtoId,
       nome: produto.nome,
       preco: precoItem,
-      quantidade: quantidade,
-      subtotal: precoItem * quantidade,
+      quantidade: qty,
+      subtotal: precoItem * qty,
       cor: cor || null,
       tamanho: tamanho || null,
       imagem_url: produto.imagem_url || null,
@@ -223,24 +213,18 @@ export default async function handler(req, res) {
 
     let resultado;
 
+    // 6) Criar carrinho se não existir
     if (!carrinhoParaUsar) {
-      // 4. Criar um novo carrinho se não existir
-      
-      // Preparar dados para inserção no carrinho
       const dadosNovoCarrinho = {
         session_id: sessionId,
         cliente_id: clienteId || null,
-        itens: [novoItem],
-        valor_total: novoItem.subtotal,
-        quantidade_itens: novoItem.quantidade,
+        itens: [novoItem],                 // se jsonb, vai como array; se text, a regra/trigger converte
+        valor_total: Number(novoItem.subtotal),
+        quantidade_itens: Number(novoItem.quantidade),
         ativo: true,
-        observacoes: observacoes || null
+        observacoes: observacoes || null,
+        ...(temCampoStatus ? { status: 'ativo' } : {})
       };
-      
-      // Adicionar campo status apenas se existir na tabela
-      if (temCampoStatus) {
-        dadosNovoCarrinho.status = 'ativo';
-      }
 
       const { data: novoCarrinho, error: novoCarrinhoError } = await supabase
         .from(`${lojaId}_carrinho_compras`)
@@ -254,50 +238,39 @@ export default async function handler(req, res) {
 
       resultado = novoCarrinho;
     } else {
-      // 5. Adicionar item ao carrinho existente
-      const itensAtuais = carrinhoParaUsar.itens || [];
-      
-      // Verificar se o produto já está no carrinho com as mesmas características
-      const itemExistenteIndex = itensAtuais.findIndex(item => 
-        item.produto_id === produtoId && 
-        item.cor === cor && 
-        item.tamanho === tamanho
+      // 7) Atualizar carrinho existente (normaliza itens)
+      const itensAtuaisRaw = carrinhoParaUsar.itens ?? [];
+      const itensAtuais = normalizeItensArray(toArray(itensAtuaisRaw));
+
+      // procura item igual (produto + cor + tamanho)
+      const idx = itensAtuais.findIndex((item) =>
+        item?.produto_id === produtoId &&
+        (item?.cor ?? null) === (cor ?? null) &&
+        (item?.tamanho ?? null) === (tamanho ?? null)
       );
 
       let novosItens;
-      let novaQuantidade;
-
-      if (itemExistenteIndex >= 0) {
-        // Atualizar quantidade do item existente
+      if (idx >= 0) {
         novosItens = [...itensAtuais];
-        novosItens[itemExistenteIndex].quantidade += quantidade;
-        novosItens[itemExistenteIndex].subtotal = novosItens[itemExistenteIndex].preco * novosItens[itemExistenteIndex].quantidade;
-        // Calcular a quantidade total correta somando todas as quantidades individuais
-        novaQuantidade = novosItens.reduce((total, item) => total + item.quantidade, 0);
+        const qAnterior = Number(novosItens[idx].quantidade) || 0;
+        novosItens[idx].quantidade = qAnterior + qty;
+        const pUnit = Number(novosItens[idx].preco) || 0;
+        novosItens[idx].subtotal = pUnit * Number(novosItens[idx].quantidade);
       } else {
-        // Adicionar novo item
         novosItens = [...itensAtuais, novoItem];
-        // Calcular a quantidade total correta somando todas as quantidades individuais
-        novaQuantidade = novosItens.reduce((total, item) => total + item.quantidade, 0);
       }
 
-      // Calcular novo valor total
-      const novoValorTotal = novosItens.reduce((total, item) => total + item.subtotal, 0);
+      const novaQuantidade = novosItens.reduce((s, it) => s + (Number(it.quantidade) || 0), 0);
+      const novoValorTotal = novosItens.reduce((s, it) => s + (Number(it.subtotal) || 0), 0);
 
-      // Preparar dados para atualização do carrinho
       const dadosAtualizacao = {
-        itens: novosItens,
-        valor_total: novoValorTotal,
-        quantidade_itens: novaQuantidade,
-        updated_at: new Date().toISOString()
+        itens: novosItens,                   // se coluna for jsonb, ok; se text e tiver trigger/converter, ok
+        valor_total: Number(novoValorTotal),
+        quantidade_itens: Number(novaQuantidade),
+        updated_at: new Date().toISOString(),
+        ...(temCampoStatus && !carrinhoParaUsar.status ? { status: 'ativo' } : {})
       };
-      
-      // Adicionar campo status apenas se existir na tabela
-      if (temCampoStatus && !carrinhoParaUsar.status) {
-        dadosAtualizacao.status = 'ativo';
-      }
 
-      // Atualizar carrinho
       const { data: carrinhoAtualizado, error: atualizacaoError } = await supabase
         .from(`${lojaId}_carrinho_compras`)
         .update(dadosAtualizacao)
@@ -326,4 +299,4 @@ export default async function handler(req, res) {
       detalhes: error.message
     });
   }
-} 
+}
